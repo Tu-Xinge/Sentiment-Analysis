@@ -1,0 +1,184 @@
+---
+title: "Stats 369 - Lab 10"
+author: "Xinge Tu - xtu424"
+date: "12/10/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+library(tidyverse)
+library(glmnet)
+```
+
+## Question 1: Who are the most ‘talkative’ characters in GoT?
+Load the dataset and explore the frequency of text sentence by (key) characters.
+
+### Data_in
+```{r}
+GoT <- read_csv("Game_of_Thrones_Script.csv")
+head(GoT)
+```
+
+### Top_5 frequency
+Find the top 5 characters who say the most lines of texts.
+```{r}
+(top_5 = sort(table(GoT$Name), decreasing = TRUE)[1:5])
+```
+
+### frequency count change over each season
+Use suitable graphs to show their frequency count change over each season.
+```{r}
+GoT %>% filter(Name %in% names(top_5)) %>% group_by(Season, Name) %>% summarise(n=n()) %>% ggplot(aes(x = Season, y = n, color = Name, group = Name)) + geom_point() + geom_line()
+
+```
+
+## Question 2: What are their sentiments in Season 1?
+Use GloVe embedding with glmnet to produce a sentiment score for each word. Roll up the sentiment scores – by taking average over all the words in a sentence – to get an overall sentiment for each line of text. You can then append this ‘Sentiment’ attribute to the raw data set.
+
+Note:
+
+  - Before you do the sentiment scoring, you would need to do some text cleaning to extract words from a sentence. For instance, replace special characters such as ‘…’, ‘—’ with space, then do `strsplit` with `split = <blank or punctuations>`.
+
+  - You would come across unmatchable words when matching words with GloVe. Most of them would seem like GoT specific, e.g. ‘yunkish’, or ‘Aegon’. You can remove them from the sentiment score calculation.
+
+### Train Semtiment Generator model
+```{r}
+con <- dplyr::src_sqlite(file.path('words2.db')) # specify db name
+glove <- tbl(con, 'glove') # table name
+glove %>% tally() %>% collect()  # check dimension
+
+
+#read in human-classified positive and negative words
+pos_words = scan(file = "positive-words.txt", blank.lines.skip = T, comment.char = ";", what = "")
+neg_words = scan(file = "negative-words.txt", blank.lines.skip = T, comment.char = ";", what = "")
+
+# bag those into training words. 1: positive; 0: negative
+train_words = tibble(words = c(pos_words,neg_words), pos = rep(1:0,c(length(pos_words), length(neg_words))))
+train_words = copy_to(con, train_words, name = 'train_words', temporary = TRUE, overwrite = TRUE)
+
+# joining with glove
+train.df <- train_words %>%  inner_join(glove, by = c('words' = 'Word')) %>% collect()
+
+# create design matrix for 'glmnet'
+train_x <- train.df %>% select(-words, -pos) %>% as.matrix()
+rownames(train_x) <- train.df$words
+
+# response
+train_y <- train.df$pos
+
+# logistical model with a mix (50/50) mix of L1 and L2 regularisation.
+fit <- cv.glmnet(train_x, train_y, family = 'binomial', alpha = 0.5)
+```
+### Define a Semtiment Generator Function
+```{r}
+predict_sentiment <- function(db_con = con, db_name = 'glove', text, model = fit){  
+  glove <- tbl(db_con, db_name)
+  word_tbl <- copy_to(db_con, 
+                      tibble(words = tolower(strsplit(text,"[[:blank:],.!?;:'\"]")[[1]])),
+                      name = "temp_words",        
+                      overwrite = TRUE,                       
+                      temporary = TRUE)
+  word_x <- inner_join(word_tbl, glove, by = c('words' = 'Word')) %>%     
+    collect() %>%     
+    select(-words) %>%     
+    as.matrix()
+  if(nrow(word_x) == 0 ) return(0)
+  senti <- predict(model$glmnet.fit, word_x, s = model$lambda.min)  
+  mean(senti)
+}
+```
+
+### text cleaning for testing set
+```{r}
+# text cleaning to extract words from a sentence: ‘…’, ‘—’ with space, then do strsplit(split = " ")
+sample_text = sample(length(GoT$Sentence),5)
+clean_text =  GoT$Sentence[sample_text] %>% str_replace_all( "-", " ") %>% str_replace_all("…"," ") %>% str_replace_all("\\."," ") %>% str_replace_all("\\,"," ") %>% str_replace_all("\\?"," ") %>% str_replace_all("\\!"," ") %>% as.array() %>% apply(1,str_trim) %>% unique()
+
+result = vector(length = length(clean_text))
+for (i in 1:length(clean_text)) {
+  result[i] = predict_sentiment(text = clean_text[i])
+}
+
+cbind(text = clean_text, score = result) %>% as.data.frame()
+```
+
+Now produce a picture showing the change in sentiments by season 1 episodes for the 5 characters identified from Q1.
+### change in sentiments by season 1
+```{r}
+new = GoT %>% filter(Season == "Season 1" & Episode == "Episode 1" & Name %in% names(top_5))
+temp = c(sample(which(new$Name=="cersei lannister"),2), 
+           sample(which(new$Name=="daenerys targaryen"),2),  
+           sample(which(new$Name=="jaime lannister"),2), 
+           sample(which(new$Name=="jon snow"),2), 
+           sample(which(new$Name=="tyrion lannister"),2))
+new = new[temp,]
+new_text = new$Sentence %>% str_replace_all( "-", " ") %>% str_replace_all("…"," ") %>% str_replace_all("\\."," ") %>% str_replace_all("\\,"," ") %>% str_replace_all("\\?"," ") %>% str_replace_all("\\!"," ") %>% as.array() %>% apply(1,str_trim) %>% unique()
+
+result = vector(length = length(new_text))
+
+for (i in 1:length(new_text)) {
+  result[i] = predict_sentiment(text = new_text[i])
+}
+
+cbind(index = 1:length(new_text), text = new_text, score = result, name = new$Name) %>% as.data.frame() %>%
+  ggplot(aes(x = index, y = score, color = name, group = name)) + geom_point()
+
+```
+
+
+## Question 3: How does a character’s sentiment evolve over time?
+Pick a character from Q1, use the sentiment scores generated from Q2 to make a graph showing the fluctuation of sentiment scores for all the texts associated with that character over each season & episode. Answer the question based on the picture produced.
+
+```{r}
+new = GoT %>% filter(Name=="jon snow")
+temp = sample(nrow(new), 10)
+new = new[temp,]
+new_text = new$Sentence %>% str_replace_all( "-", " ") %>% str_replace_all("…"," ") %>% str_replace_all("\\."," ") %>% str_replace_all("\\,"," ") %>% str_replace_all("\\?"," ") %>% str_replace_all("\\!"," ") %>% as.array() %>% apply(1,str_trim) %>% unique()
+
+result = vector(length = length(new_text))
+
+for (i in 1:length(new_text)) {
+  result[i] = predict_sentiment(text = new_text[i])
+}
+
+cbind(season = new$Season,text = new_text, score = result, Episode = new$Episode) %>% as.data.frame() %>% 
+  ggplot(aes(x = season, y = score, color = Episode, group = Episode)) + geom_point()
+
+
+```
+
+## Question 4: What are the most frequently spoken words for a character? Are they of good / bad sentiment?
+For the character you chose from Q3, produce a word cloud showing the most frequently used words spoken by that character, colour the words by their sentiment scores (from Q2).
+
+```{r}
+library("wordcloud")
+new = GoT %>% filter(Name=="jon snow")
+temp = sample(nrow(new),50)
+new = new[temp,]
+new_text = new$Sentence %>% str_replace_all( "-", " ") %>% str_replace_all("…"," ") %>% str_replace_all("\\."," ") %>% str_replace_all("\\,"," ") %>% str_replace_all("\\?"," ") %>% str_replace_all("\\!"," ") %>% as.array() %>% apply(1,str_trim) %>% unique() %>% strsplit(" ") %>% unlist() %>% table()
+
+d = cbind(word = names(new_text), freq = as.numeric(new_text))[-c(1:21),] %>% as.data.frame()
+d$freq = as.numeric(d$freq)
+d1 = d %>% filter(freq >= 4)
+
+new_text = d1$word
+
+result = vector(length = length(new_text))
+
+for (i in 1:length(new_text)) {
+  result[i] = predict_sentiment(text = new_text[i])
+}
+
+d1$score = result
+
+set.seed(1234)
+wordcloud(words = d1$word, freq = d1$freq,
+          colors= d1$score+3)
+
+
+wordcloud(words = d$word, freq = d$freq, min.freq = 1,
+          max.words = 200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+```
+
